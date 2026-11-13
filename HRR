@@ -1,0 +1,553 @@
+-- Hyper Realistic Ragdoll / SmugLib V2
+-- Temporary client-side access; no ownership or purchases are changed.
+local initialIdentity = type(getthreadidentity)=="function" and getthreadidentity() or nil
+local function restoreIdentity()
+    if initialIdentity and type(setthreadidentity)=="function" then pcall(setthreadidentity,initialIdentity) end
+end
+local url = "https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua"
+local ok, source = pcall(game.HttpGet, game, url .. "?v=" .. game:GetService("HttpService"):GenerateGUID(false), true)
+assert(ok and type(source) == "string" and source ~= "", "SmugLib V2: " .. tostring(source))
+local factory, compileError = loadstring(source)
+assert(factory, compileError)
+local Library = factory()
+assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "SmugLib V2 API unavailable")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local env = type(getgenv) == "function" and getgenv() or _G
+if env.SmugHRR and env.SmugHRR.Unload then pcall(env.SmugHRR.Unload, env.SmugHRR) end
+assert(game.PlaceId == 101277003916102, "This script is for Hyper Realistic Ragdoll")
+local client = player:WaitForChild("PlayerScripts"):WaitForChild("Client")
+local link = require(client.UI.SandboxLink)
+local root = require(client.UI.Root)
+local state = require(client.UI.State)
+local runner = require(client.Events.EventRunner)
+local freeze = require(client.World.TimeFreeze)
+local templates = ReplicatedStorage:WaitForChild("Templates"):WaitForChild("Tools")
+local toolsConfig = require(ReplicatedStorage.Shared.Config.Tools)
+local eventKeys = require(ReplicatedStorage.Shared.Net.Keys).Events
+local eventRules = require(ReplicatedStorage.Shared.Rules.EventRules)
+local vehicleConfig = require(ReplicatedStorage.Shared.Config.Vehicles)
+local vehicles = require(client.Vehicles)
+local actions = require(client.UI.Actions)
+local HttpService = game:GetService("HttpService")
+local configPath = "SmugHRR_"..tostring(player.UserId)..".json"
+local configDefaults = {unlock=false, fly=false, noclip=false, speed=false, jump=false, infiniteJump=false,
+    flySpeed=60, walkSpeed=32, jumpPower=80, lab={}}
+local config=table.clone(configDefaults)
+config.lab={}
+local configAvailable=type(readfile)=="function" and type(writefile)=="function"
+if configAvailable then
+    local readOk,data=pcall(readfile,configPath)
+    if readOk and type(data)=="string" then
+        local decodeOk,saved=pcall(HttpService.JSONDecode,HttpService,data)
+        if decodeOk and type(saved)=="table" then
+            for _,key in ipairs({"unlock","fly","noclip","speed","jump","infiniteJump"}) do
+                if type(saved[key])=="boolean" then config[key]=saved[key] end
+            end
+            for key,limits in pairs({flySpeed={10,200},walkSpeed={8,100},jumpPower={30,150}}) do
+                local value=tonumber(saved[key])
+                if value and value==value and value~=math.huge and value~=-math.huge then config[key]=math.clamp(value,limits[1],limits[2]) end
+            end
+            if type(saved.loadout)=="table" then config.loadout=saved.loadout end
+            if type(saved.lab)=="table" then config.lab=saved.lab end
+        end
+    end
+end
+local app = {alive=true, enabled=false, fly=false, noclip=false, speed=false, jump=false,
+    infiniteJump=false, freeze=false, mode=nil, flySpeed=60, walkSpeed=32, jumpPower=80,
+    clones={}, collisions={}, connections={}, controls={}, savedHumanoid=nil, status="Ready", config=config, restoring=true, suppressSave=false}
+env.SmugHRR = app
+local function connect(signal, fn) local c=signal:Connect(fn); table.insert(app.connections,c); return c end
+local function report(s)
+    app.status=s
+    if app.statusLabel then pcall(function() app.statusLabel:SetText("Status: "..s) end) end
+end
+local saveGeneration=0
+local function saveConfig(immediate)
+    if app.restoring or app.suppressSave or not configAvailable then return end
+    saveGeneration+=1
+    local generation=saveGeneration
+    local function write()
+        if not immediate and generation~=saveGeneration then return end
+        local ok,encoded=pcall(HttpService.JSONEncode,HttpService,config)
+        if not ok then app.configError=tostring(encoded); report("Config encoding failed"); return false end
+        local written,err=pcall(writefile,configPath,encoded)
+        if not written then app.configError=tostring(err); report("Config save failed: "..tostring(err)); return false end
+        app.configError=nil
+        return true
+    end
+    if immediate then return write() else task.delay(0.35,write) end
+end
+local function setConfig(key,value)
+    config[key]=value
+    saveConfig(false)
+end
+connect(player.OnTeleport,function(teleportState)
+    if teleportState==Enum.TeleportState.Started then saveConfig(true) end
+end)
+connect(Players.PlayerRemoving,function(leaving)
+    if leaving==player then saveConfig(true) end
+end)
+local function getChar()
+    local char=player.Character
+    return char, char and char:FindFirstChildOfClass("Humanoid"), char and char:FindFirstChild("HumanoidRootPart")
+end
+local function capture(hum)
+    if not hum then return end
+    if app.savedHumanoid and app.savedHumanoid.hum==hum then return end
+    app.savedHumanoid={hum=hum, walk=hum.WalkSpeed, jumpPower=hum.JumpPower, jumpHeight=hum.JumpHeight,
+        autoRotate=hum.AutoRotate, useJumpPower=hum.UseJumpPower}
+end
+local function resetCollision()
+    for part, original in pairs(app.collisions) do
+        if part.Parent then pcall(function() part.CanCollide=original end) end
+    end
+    table.clear(app.collisions)
+end
+local function destroyFly()
+    if app.velocity then app.velocity:Destroy(); app.velocity=nil end
+    if app.gyro then app.gyro:Destroy(); app.gyro=nil end
+    if app.flyHum and app.flyHum.Parent then pcall(function() app.flyHum.AutoRotate=app.flyAuto end) end
+    app.flyHum=nil
+end
+-- The game owns its persisted profile. This overlay is only used while enabled.
+local original = {toolOwned=state.toolOwned, hasFeature=state.hasFeature,
+    toolEquipped=state.toolEquipped, setEquipped=state.setEquipped, permanent=state.Permanent, request=state.request, unlimited=eventRules.unlimited}
+local revision = root.scope:Value(0)
+local allTools = {}
+for _,template in ipairs(templates:GetChildren()) do
+    local key=template:GetAttribute("ToolKey")
+    if template:IsA("Tool") and type(key)=="string" and toolsConfig[key] then allTools[key]=true end
+end
+local function changed()
+    revision:set(root.Fusion.peek(revision)+1)
+end
+local function localRead(use)
+    use(revision)
+    return app.enabled
+end
+local permanentProxy=root.scope:Computed(function(use)
+    local real=use(original.permanent)
+    if localRead(use) then return allTools end
+    return real
+end)
+local eventSet={}
+for _,key in ipairs(eventKeys) do if type(key)=="string" and client.Events:FindFirstChild(key) then eventSet[key]=true end end
+local wrappers={}
+wrappers.request=function(key,data)
+    if app.enabled and key=="UseEventCharge" and type(data)=="string" and eventSet[data] then
+        if not runner.hasRoom() then return {ok=false,code="Unknown"} end
+        app.eventStarted=data
+        app.eventCancelled=false
+        return {ok=true}
+    end
+    return original.request(key,data)
+end
+local unlimitedWrapper=function(features,key)
+    if app.enabled and eventSet[key] then return true end
+    return original.unlimited(features,key)
+end
+wrappers.toolOwned=function(use,row)
+    if localRead(use) and row and allTools[row.key] then return true end
+    return original.toolOwned(use,row)
+end
+wrappers.hasFeature=function(use,key)
+    if localRead(use) and (key=="LabControls" or key=="BarrelSpawn") then return true end
+    return original.hasFeature(use,key)
+end
+wrappers.toolEquipped=function(use,key)
+    if localRead(use) then return table.find(app.localLoadout or {},key)~=nil end
+    return original.toolEquipped(use,key)
+end
+local function findTools(container,key)
+    local found={}
+    if container then for _,item in ipairs(container:GetChildren()) do
+        if item:IsA("Tool") and item:GetAttribute("ToolKey")==key then table.insert(found,item) end
+    end end
+    return found
+end
+function app:ReconcileTools()
+    if not self.enabled then return end
+    local backpack=player:FindFirstChildOfClass("Backpack")
+    local char=player.Character
+    if not backpack then return end
+    local selected={}
+    for _,key in ipairs(self.localLoadout) do selected[key]=true end
+    for _,container in ipairs({backpack,char}) do
+        if container then for _,item in ipairs(container:GetChildren()) do
+            local key=item:IsA("Tool") and item:GetAttribute("ToolKey")
+            if key and allTools[key] and not selected[key] then
+                if item:GetAttribute("SmugHRRTemporary") then item:Destroy()
+                else item.Parent=self.stash end
+            end
+        end end
+    end
+    for _,key in ipairs(self.localLoadout) do
+        local active=findTools(backpack,key)
+        for _,v in ipairs(findTools(char,key)) do table.insert(active,v) end
+        if #active==0 then
+            local stashed=findTools(self.stash,key)[1]
+            if stashed then stashed.Parent=backpack else
+                local template=templates:FindFirstChild(key)
+                if template and template:IsA("Tool") and template:GetAttribute("ToolKey")==key then
+                    local copy=template:Clone()
+                    copy:SetAttribute("SmugHRRTemporary",true)
+                    copy.Parent=backpack
+                    table.insert(self.clones,copy)
+                end
+            end
+        end
+    end
+end
+wrappers.setEquipped=function(key,on)
+    if not app.enabled then return original.setEquipped(key,on) end
+    if not allTools[key] then report("Tool template is unavailable"); return false end
+    local index=table.find(app.localLoadout,key)
+    if on and not index then
+        if #app.localLoadout>=state.MaxLoadout then
+            report("Hotbar full; unequip another tool first")
+            local kit=client.UI:FindFirstChild("Kit")
+            if kit then pcall(function() require(kit.Toast).show("Your hotbar is full. Unequip a tool first.","Bad") end) end
+            return false
+        end
+        table.insert(app.localLoadout,key)
+    elseif not on and index then table.remove(app.localLoadout,index) end
+    app:ReconcileTools()
+    config.loadout=table.clone(app.localLoadout)
+    saveConfig(false)
+    changed()
+    report((on and "Added to hotbar: " or "Removed from hotbar: ")..key)
+    return true
+end
+state.toolOwned=wrappers.toolOwned
+state.hasFeature=wrappers.hasFeature
+state.toolEquipped=wrappers.toolEquipped
+state.setEquipped=wrappers.setEquipped
+state.request=wrappers.request
+eventRules.unlimited=unlimitedWrapper
+state.Permanent=permanentProxy
+-- Re-evaluate cards already open before the overlay was installed.
+local function refreshNative()
+    state.Session:set(table.clone(root.Fusion.peek(state.Session)))
+    state.Profile:set(table.clone(root.Fusion.peek(state.Profile)))
+end
+local labKeys={"FreezeTime","Fly","SpawnMode","LaunchMode","ExplodeMode","HealMode","DeleteMode","BarrelMode"}
+local labSaveKeys={SlowMotion=true,FreezeTime=true,FreeCamera=true,Fly=true,SpawnMode=true,LaunchMode=true,
+    ExplodeMode=true,HealMode=true,DeleteMode=true,BarrelMode=true,GrabMode=true,ScanMode=true,RunSpeed=true,Gravity=true}
+local savedVehiclePasses={}
+local function setVehiclesUnlocked(enabled)
+    for _,key in ipairs(vehicleConfig.Order) do
+        local row=vehicleConfig.Rows[key]
+        if row then
+            if enabled then
+                if row.pass and not savedVehiclePasses[key] then savedVehiclePasses[key]=row.pass end
+                if savedVehiclePasses[key] then row.pass=nil end
+            elseif savedVehiclePasses[key] then
+                if row.pass==nil then row.pass=savedVehiclePasses[key] end
+                savedVehiclePasses[key]=nil
+            end
+            local vehicle=vehicles.get(key)
+            if vehicle and vehicle.prompt and row.prompt then
+                local passes=root.Fusion.peek(state.Session).Passes or {}
+                local owned=not row.pass
+                for _,pass in ipairs(row.pass or {}) do if passes[pass] then owned=true end end
+                vehicle.prompt.ActionText=owned and row.prompt.action or "Unlock"
+            end
+        end
+    end
+end
+local actionDisconnect=actions.on("Sandbox",function(change)
+    if app.alive and app.enabled and not app.restoring and not app.suppressSave and type(change)=="table" and labSaveKeys[change.key] then
+        local value=change.value
+        -- Walk speed overrides are configured separately from the game's Lab speed.
+        if change.key=="RunSpeed" and app.speed and value==app.walkSpeed then return end
+        if type(value)=="boolean" or type(value)=="number" then config.lab[change.key]=value; saveConfig(false) end
+    end
+end)
+function app:RemoveTools()
+    for _,tool in ipairs(self.clones) do if tool.Parent then tool:Destroy() end end
+    table.clear(self.clones)
+    if self.stash then
+        local backpack=player:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _,tool in ipairs(self.stash:GetChildren()) do if tool:IsA("Tool") then tool.Parent=backpack end end
+        elseif not self.restorePending then
+            self.restorePending=true
+            local pendingStash=self.stash
+            task.spawn(function()
+                local nextBackpack=player:WaitForChild("Backpack",30)
+                self.restorePending=false
+                if nextBackpack and self.stash==pendingStash and not self.enabled then self:RemoveTools() end
+            end)
+        end
+        if #self.stash:GetChildren()==0 then self.stash:Destroy(); self.stash=nil end
+    end
+end
+function app:SetUnlock(on)
+    if self.enabled==on then return end
+    if on then
+        self.localLoadout={}
+        local requested=type(config.loadout)=="table" and config.loadout or root.Fusion.peek(state.Loadout)
+        for _,key in ipairs(requested) do
+            if type(key)=="string" and allTools[key] and not table.find(self.localLoadout,key) and #self.localLoadout<state.MaxLoadout then
+                table.insert(self.localLoadout,key)
+            end
+        end
+        if not self.stash then
+            self.stash=Instance.new("Folder")
+            self.stash.Name="SmugHRRStash"
+            self.stash.Parent=player:WaitForChild("PlayerScripts")
+        end
+        self.labBefore={}
+        for _,key in ipairs(labKeys) do
+            local value=link.value(key)
+            if not value then value=link.value(key) end
+            self.labBefore[key]=value and root.Fusion.peek(value)==true or false
+        end
+        self.enabled=true
+        setVehiclesUnlocked(true)
+        self:ReconcileTools()
+        changed(); refreshNative()
+        report("Tools, Lab, events and vehicles unlocked locally")
+        setConfig("unlock",true)
+    else
+        self.enabled=false
+        setVehiclesUnlocked(false)
+        for _,key in ipairs(labKeys) do
+            local value=link.value(key)
+            if value and root.Fusion.peek(value) and not self.labBefore[key] then pcall(link.set,key,false) end
+        end
+        self:RemoveTools()
+        self.mode=nil; self.freeze=false; self.localLoadout=nil
+        changed(); refreshNative()
+        report("Local access disabled")
+        setConfig("unlock",false)
+    end
+end
+function app:SetMode(mode)
+    if self.mode then pcall(link.set,self.mode,false) end
+    self.mode=nil
+    if mode and self.enabled then
+        link.value(mode)
+        local worked, err=pcall(link.set,mode,true)
+        if worked then self.mode=mode; report("Lab: "..mode.." - click in the world") else report("Lab error: "..tostring(err)) end
+    elseif mode then report("Enable Unlock All first") end
+    for key, control in pairs(self.modeControls or {}) do pcall(function() control:Set(key==self.mode) end) end
+end
+function app:SetFreeze(on)
+    if on and not self.enabled then report("Enable Unlock All first"); return false end
+    if on and not self.freeze then self.freezeBefore=freeze.isFrozen() end
+    if not on and not self.freeze then return false end
+    link.value("FreezeTime")
+    local wanted=on or self.freezeBefore==true
+    local worked,err=pcall(link.set,"FreezeTime",wanted)
+    if worked then self.freeze=on; report(on and "Time frozen" or "Time resumed") else report("Stop time: "..tostring(err)) end
+    return worked and on
+end
+function app:SetFly(on)
+    self.fly=on
+    if not on then destroyFly(); report("Flight disabled") else report("Flight enabled: WASD follows the camera") end
+end
+function app:SetNoclip(on)
+    self.noclip=on
+    if not on then resetCollision() end
+end
+function app:SetSpeed(on)
+    local _,hum=getChar(); capture(hum)
+    if on and not self.speed then
+        local speedValue=link.value("RunSpeed")
+        if not speedValue then speedValue=link.value("RunSpeed") end
+        self.oldRunSpeed=speedValue and root.Fusion.peek(speedValue) or 16
+    end
+    self.speed=on
+    link.value("RunSpeed")
+    local worked,err=pcall(link.set,"RunSpeed",on and self.walkSpeed or (self.oldRunSpeed or 16))
+    if not worked then report("Speed: "..tostring(err)) end
+end
+function app:SetJump(on)
+    local _,hum=getChar(); capture(hum)
+    self.jump=on
+    local saved=self.savedHumanoid
+    if hum and saved and saved.hum==hum then
+        if on then
+            if hum.UseJumpPower then hum.JumpPower=self.jumpPower else hum.JumpHeight=self.jumpPower*self.jumpPower/(2*workspace.Gravity) end
+        else hum.JumpPower=saved.jumpPower; hum.JumpHeight=saved.jumpHeight end
+    end
+end
+function app:StopAll()
+    self.eventCancelled=true
+    if self.eventStarted and runner.active()==self.eventStarted then pcall(runner.stop) end
+    self:SetMode(nil); self:SetFreeze(false); self:SetFly(false); self:SetNoclip(false)
+    if self.speed then self:SetSpeed(false) end
+    self:SetJump(false); self.infiniteJump=false
+    if self.enabled then self:SetUnlock(false) else self:RemoveTools() end
+    for _,control in pairs(self.controls) do pcall(function() control:Set(false) end) end
+    for _,key in ipairs({"unlock","fly","noclip","speed","jump","infiniteJump"}) do config[key]=false end
+    saveConfig(false)
+    report("All features stopped")
+end
+function app:Unload()
+    if not self.alive then return end
+    saveConfig(true)
+    self.suppressSave=true
+    self:StopAll(); self.alive=false
+    if actionDisconnect then actionDisconnect(); actionDisconnect=nil end
+    if eventRules.unlimited==unlimitedWrapper then eventRules.unlimited=original.unlimited end
+    for key,wrapper in pairs(wrappers) do if state[key]==wrapper then state[key]=original[key] end end
+    if state.Permanent==permanentProxy then state.Permanent=original.permanent end
+    refreshNative()
+    for _,c in ipairs(self.connections) do c:Disconnect() end
+    table.clear(self.connections)
+    if self.window then local w=self.window; self.window=nil; restoreIdentity(); pcall(function() w:Kill() end) end
+    if env.SmugHRR==self then env.SmugHRR=nil end
+end
+connect(player.CharacterAdded,function(char)
+    destroyFly(); resetCollision(); app.savedHumanoid=nil
+    task.spawn(function()
+        local hum=char:WaitForChild("Humanoid",10)
+        if not app.alive or player.Character~=char then return end
+        capture(hum)
+        if app.speed then pcall(link.set,"RunSpeed",app.walkSpeed) end
+        if app.jump then app:SetJump(true) end
+        if app.enabled then task.wait(1); if app.alive and app.enabled and player.Character==char then app:ReconcileTools() end elseif app.stash then app:RemoveTools() end
+    end)
+end)
+connect(UIS.JumpRequest,function() if app.infiniteJump and not app.fly then local _,hum=getChar(); if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end end end)
+connect(RunService.Stepped,function()
+    local char,hum=getChar()
+    if app.noclip and char then
+        for _,p in ipairs(char:GetDescendants()) do if p:IsA("BasePart") then
+            if app.collisions[p]==nil then app.collisions[p]=p.CanCollide end
+            if p.CanCollide then p.CanCollide=false end
+        end end
+    end
+    if app.jump and hum then
+        capture(hum)
+        if hum.UseJumpPower then hum.JumpPower=app.jumpPower else hum.JumpHeight=app.jumpPower*app.jumpPower/(2*workspace.Gravity) end
+    end
+end)
+connect(RunService.RenderStepped,function()
+    if not app.fly then return end
+    local _,hum,part=getChar(); local camera=workspace.CurrentCamera
+    if not hum or not part or not camera or hum.Health<=0 then destroyFly(); return end
+    if app.flyHum~=hum or not app.velocity or app.velocity.Parent~=part then
+        destroyFly(); app.flyHum=hum; app.flyAuto=hum.AutoRotate; hum.AutoRotate=false
+        local v=Instance.new("BodyVelocity"); v.Name="SmugHRRFlyVelocity"; v.MaxForce=Vector3.new(1e8,1e8,1e8); v.P=20000; v.Parent=part; app.velocity=v
+        local g=Instance.new("BodyGyro"); g.Name="SmugHRRFlyGyro"; g.MaxTorque=Vector3.new(1e8,1e8,1e8); g.P=50000; g.D=1500; g.Parent=part; app.gyro=g
+    end
+    hum.AutoRotate=false
+    local cf=camera.CFrame
+    local direction=Vector3.zero
+    if not UIS:GetFocusedTextBox() then
+        if UIS:IsKeyDown(Enum.KeyCode.W) then direction+=cf.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then direction-=cf.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then direction+=cf.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then direction-=cf.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.E) then direction+=Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.Q) then direction-=Vector3.yAxis end
+    end
+    app.velocity.Velocity=direction.Magnitude>1 and direction.Unit*app.flySpeed or direction*app.flySpeed
+    local look=Vector3.new(cf.LookVector.X,0,cf.LookVector.Z)
+    if look.Magnitude>0.001 then app.gyro.CFrame=CFrame.lookAt(part.Position,part.Position+look.Unit) end
+    part.AssemblyAngularVelocity=Vector3.zero
+end)
+restoreIdentity()
+-- Remove only stale windows from this script after an interrupted or failed reload.
+local seenContainers={}
+local function removeStale(container)
+    if not container or seenContainers[container] then return end
+    seenContainers[container]=true
+    pcall(function()
+        for _,gui in ipairs(container:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Name=="SmugLibCore" then
+                for _,item in ipairs(gui:GetDescendants()) do
+                    if item:IsA("TextLabel") and (item.Text=="SMUG  |  HYPER RAGDOLL" or item.Text=="SMUG / Hyper Realistic Ragdoll") then
+                        gui:Destroy(); break
+                    end
+                end
+            end
+        end
+    end)
+end
+if type(gethui)=="function" then local ok,parent=pcall(gethui); if ok then removeStale(parent) end end
+removeStale(game:GetService("CoreGui"))
+removeStale(player:FindFirstChildOfClass("PlayerGui"))
+local windowOk,win=pcall(function()
+    return Library:CreateWindow("SMUG  |  HYPER RAGDOLL",{Width=490,Height=470,ToggleKey=Enum.KeyCode.RightShift,
+        ConfigKey="SmugHRR_UI_v2",ConfigAutoSave=false,AccentColor=Color3.fromRGB(96,131,231),
+        AccentLightColor=Color3.fromRGB(141,188,255),SectionHeaderColor=Color3.fromRGB(30,42,67),
+        OnClose=function() app:Unload() end})
+end)
+if not windowOk then app:Unload(); error("SmugLib UI: "..tostring(win)) end
+app.window=win
+win:SetConfig({},false)
+local home=win:Folder("Home")
+local access=home:Section("UNLOCK ALL")
+access:Label("Unlock tools, Lab controls, events and vehicles for this session.")
+app.controls.unlock=access:Toggle("Unlock All",function(on) app:SetUnlock(on) end,false)
+access:Label("Use the game's own Tools, Lab and Events menus.")
+local events=home:Section("EVENTS")
+events:Label("Select an event in the game's Events menu and press Use.")
+events:Button("Stop Current Event",function()
+    app.eventCancelled=true
+    runner.stop()
+    report("Requested event stop")
+end)
+local playerTab=win:Folder("Player")
+local flight=playerTab:Section("FLIGHT")
+app.controls.fly=flight:Toggle("Fly",function(on) app:SetFly(on); setConfig("fly",on) end,false)
+local flySlider=flight:Slider("Fly speed",10,200,60,function(v) app.flySpeed=v; setConfig("flySpeed",v) end,1)
+flight:Label("WASD follows the camera  |  Space / E up  |  Ctrl / Q down")
+local movement=playerTab:Section("MOVEMENT")
+app.controls.noclip=movement:Toggle("Noclip",function(on) app:SetNoclip(on); setConfig("noclip",on) end,false)
+app.controls.speed=movement:Toggle("Walk speed",function(on) app:SetSpeed(on); setConfig("speed",on) end,false)
+local walkSlider=movement:Slider("Walk speed value",8,100,32,function(v)
+    app.walkSpeed=v; if app.speed then pcall(link.set,"RunSpeed",v) end; setConfig("walkSpeed",v)
+end,1)
+app.controls.jump=movement:Toggle("Jump boost",function(on) app:SetJump(on); setConfig("jump",on) end,false)
+local jumpSlider=movement:Slider("Jump power",30,150,80,function(v) app.jumpPower=v; setConfig("jumpPower",v) end,1)
+app.controls.infinite=movement:Toggle("Infinite jump",function(on) app.infiniteJump=on; setConfig("infiniteJump",on) end,false)
+local settings=win:Folder("Settings")
+local status=settings:Section("STATUS")
+app.statusLabel=status:Label("Status: Ready")
+status:Label(configAvailable and "Config: automatic saving enabled" or "Config: executor file access unavailable")
+status:Label("Right Shift shows or hides the menu.")
+local controls=settings:Section("CONTROLS")
+controls:Button("Save Config",function() if not configAvailable then report("Config unavailable") elseif saveConfig(true) then report("Config saved") end end)
+controls:Button("Stop All",function() app:StopAll() end)
+controls:Button("Unload",function() app:Unload() end)
+-- Restore only validated values after every control and adapter is ready.
+app.flySpeed=config.flySpeed; app.walkSpeed=config.walkSpeed; app.jumpPower=config.jumpPower
+flySlider:Set(app.flySpeed); walkSlider:Set(app.walkSpeed); jumpSlider:Set(app.jumpPower)
+if config.unlock then
+    app:SetUnlock(true)
+    local modes={SpawnMode=true,LaunchMode=true,ExplodeMode=true,HealMode=true,DeleteMode=true,BarrelMode=true}
+    for _,key in ipairs({"SlowMotion","FreezeTime","FreeCamera","Fly","GrabMode","ScanMode","RunSpeed","Gravity",
+        "SpawnMode","LaunchMode","ExplodeMode","HealMode","DeleteMode","BarrelMode"}) do
+        local value=config.lab[key]
+        local valid=(type(value)=="boolean" and key~="RunSpeed" and key~="Gravity") or
+            (type(value)=="number" and value==value and key=="RunSpeed" and value>=8 and value<=60) or
+            (type(value)=="number" and value==value and key=="Gravity" and value>=10 and value<=200)
+        if valid then
+            if modes[key] and value then app.mode=key end
+            link.value(key); pcall(link.set,key,value)
+        end
+    end
+end
+if config.fly then app:SetFly(true) end
+if config.noclip then app:SetNoclip(true) end
+if config.speed then app:SetSpeed(true) end
+if config.jump then app:SetJump(true) end
+app.infiniteJump=config.infiniteJump
+restoreIdentity()
+for key,control in pairs(app.controls) do
+    local value=config[key=="infinite" and "infiniteJump" or key]
+    control:Set(value==true)
+end
+app.restoring=false
+win:Notify("Ready  |  Right Shift toggles the menu",4)
+refreshNative()
